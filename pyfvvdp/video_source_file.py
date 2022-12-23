@@ -261,6 +261,177 @@ class video_reader_yuv_pytorch(video_reader):
         return Yuv
 
 
+class yuv_video_reader(video_reader):
+    def __init__(self, vidfile, width, height, yuv_fmt, fps):
+
+        self.width = width
+        self.src_width = self.width
+        self.height = height
+        self.src_height = self.height
+        self.yuv_fmt = yuv_fmt
+
+        self.avg_fps = fps
+
+        if len(self.yuv_fmt) < 8:
+            self.bit_depth = 8
+        else:
+            self.bit_depth = int(self.yuv_fmt[7:9])
+
+        if self.bit_depth > 8:
+            self.dtype = np.uint16
+        else:
+            self.dtype = np.uint8
+
+        chroma_ss = self.yuv_fmt[3:6]
+
+        self.curr_frame = 0
+
+        y_channel_pixels = int(self.width * self.height)
+        self.y_pixels = y_channel_pixels
+        self.y_shape = (self.height, self.width)
+
+        if chroma_ss == "444":
+            frame_bytes = y_channel_pixels * 3
+            self.uv_pixels = y_channel_pixels
+        elif chroma_ss == "420":
+            frame_bytes = y_channel_pixels * 3 // 2
+            self.uv_pixels = int(y_channel_pixels / 4)
+        else:
+            raise RuntimeError("Unrecognized chroma subsampling.")
+
+        if self.bit_depth > 8:
+            frame_bytes *= 2
+
+        self.frames = int(os.stat(vidfile).st_size / frame_bytes)
+
+        self.mm = np.memmap(vidfile, self.dtype, mode="r")
+
+    def get_frame(self):
+
+        offset = 0
+
+        Y = self.mm[offset:offset + self.y_pixels]
+        _ = self.mm[offset + self.y_pixels:offset + self.y_pixels + self.uv_pixels]
+        _ = self.mm[offset + self.y_pixels + self.uv_pixels:offset + self.y_pixels + 2 * self.uv_pixels]
+
+        self.curr_frame += 1
+
+        Y = np.reshape(Y, self.y_shape, 'C')
+        return Y
+
+    def unpack(self, x, device):
+        Y = x
+
+        Y_float = self._fixed2float_upscale(Y, device)
+
+        return Y_float
+
+    def _np_to_torchfp32(self, X, device):
+        if X.dtype == np.uint8:
+            return torch.tensor(X, dtype=torch.uint8).to(device).to(torch.float32)
+        elif X.dtype == np.uint16:
+            return self._npuint16_to_torchfp32(X, device)
+
+    def _fixed2float_upscale(self, Y, device):
+        offset = 16 / 219
+        weight = 1 / (2 ** (self.bit_depth - 8) * 219)
+
+        Yuv = torch.empty(self.height, self.width, 1, device=device)
+
+        Y = self._np_to_torchfp32(Y, device)
+        Yuv[:, :, 0] = torch.clip(weight * Y - offset, 0, 1).reshape(self.height, self.width)
+
+        return Yuv
+
+    def __del__(self):
+        self.mm = None
+
+    def close(self):
+        self.mm = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.close()
+
+
+'''
+Use yuv video reader to read video frames, one by one
+'''
+
+
+class fvvdp_yuv_video_source_file(fvvdp_video_source_dm):
+
+    def __init__(self, test_fname, reference_fname, width, height, yuv_fmt, fps, display_photometry, frames=-1):
+
+        self.reader = yuv_video_reader
+        self.reference_vidr = self.reader(reference_fname, width, height, yuv_fmt, fps)
+        self.test_vidr = self.reader(test_fname, width, height, yuv_fmt, fps)
+
+        self.frames = self.test_vidr.frames if frames == -1 else frames
+
+        for vr in [self.test_vidr, self.reference_vidr]:
+            if vr == self.test_vidr:
+                logging.debug(f"Test video '{test_fname}':")
+            else:
+                logging.debug(f"Reference video '{reference_fname}':")
+
+            logging.debug(
+                f" size [{vr.src_width}x{vr.src_height}], fps: {vr.avg_fps}, pixfmt: {vr.yuv_fmt}, frames: {self.frames}")
+
+        self.dm_photometry = display_photometry
+
+    # Return (height, width, frames) touple with the resolution and
+    # the length of the video clip.
+    def get_video_size(self):
+        if hasattr(self.test_vidr, 'resize_fn') and self.test_vidr.resize_fn is not None:
+            return (self.test_vidr.resize_height, self.test_vidr.resize_width, self.frames)
+        else:
+            return (self.test_vidr.height, self.test_vidr.width, self.frames)
+
+    # Return the frame rate of the video
+    def get_frames_per_second(self) -> int:
+        return self.test_vidr.avg_fps
+
+    # Get a pair of test and reference video frames as a single-precision luminance map
+    # scaled in absolute inits of cd/m^2. 'frame' is the frame index,
+    # starting from 0.
+    def get_test_frame(self, frame, device) -> Tensor:
+        # if not self.last_test_frame is None and frame == self.last_test_frame[0]:
+        #     return self.last_test_frame[1]
+        L = self._get_frame(self.test_vidr, frame, device)
+        # self.last_test_frame = (frame,L)
+        return L
+
+    def get_reference_frame(self, frame, device) -> Tensor:
+        # if not self.last_reference_frame is None and frame == self.last_reference_frame[0]:
+        #     return self.last_reference_frame[1]
+        L = self._get_frame(self.reference_vidr, frame, device)
+        # self.reference_test_frame = (frame,L)
+        return L
+
+    def _get_frame(self, vid_reader, frame, device):
+
+        if frame != (vid_reader.curr_frame):
+            raise RuntimeError('Video can be currently only read frame-by-frame. Random access not implemented.')
+
+        frame_np = vid_reader.get_frame()
+
+        if frame_np is None:
+            raise RuntimeError('Could not read frame {}'.format(frame))
+
+        return self._prepare_frame(frame_np, device, vid_reader.unpack)
+
+    def _prepare_frame(self, frame_np, device, unpack_fn):
+        frame_t_hwc = unpack_fn(frame_np, device)
+        frame_t = reshuffle_dims(frame_t_hwc, in_dims='HWC', out_dims="BCFHW")
+        L = self.dm_photometry.forward(frame_t)
+
+        return L
+
+
+
 '''
 Use ffmpeg to read video frames, one by one.
 '''
