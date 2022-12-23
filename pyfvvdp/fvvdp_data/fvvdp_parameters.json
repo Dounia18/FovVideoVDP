@@ -18,7 +18,7 @@
     "csf_sigma": -1.5,
     "sensitivity_correction": 16.2596, 
     "masking_model": "min_mutual_masking_perc_norm2",
-    "local_adapt": "gpyr",
+    "local_adapt": "spyr",
     "contrast": "weber", 
     "jod_a": -0.0161713, 
     "log_jod_exp": -0.2280,

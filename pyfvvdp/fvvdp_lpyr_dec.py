@@ -2,10 +2,10 @@
 import torch
 import torch.nn.functional as Func
 import numpy as np 
-#import scipy.io as spio
 import os
 import sys
-#import torch.autograd.profiler as profiler
+import math
+from torchvision.transforms import GaussianBlur, Resize
 
 def ceildiv(a, b):
     return -(-a // b)
@@ -273,24 +273,282 @@ class fvvdp_contrast_pyr(fvvdp_lpyr_dec):
         return lpyr, L_bkg_pyr
 
 
+class fvvdp_spyr_dec(fvvdp_lpyr_dec):
 
-    # def gausspyr_expand(self, x, sz = None, kernel_a = 0.4):
-    #     if sz is None:
-    #         sz = [x.shape[-2]*2, x.shape[-1]*2]
+    def __init__(self, W, H, ppd, device):
+        self.device = device
+        self.ppd = ppd
+        self.min_freq = 0.5
+        self.W = W
+        self.H = H
 
-    #     K_vert, K_horiz = self.get_kernels( x, kernel_a )
+        self.lo0filt, self.hi0filt, self.lofilt, self.bfilts, self.steermtx, self.harmonics = self.spFilter()
 
-    #     y_a = self.interleave_zeros(x, dim=2)[...,0:sz[0],:]
-    #     y_a = self.gausspyr_expand_pad(y_a, padding=2, axis=-2)
-    #     y_a = Func.conv2d(y_a, K_vert*2)
+        max_levels = self.max_levels(min(W, H), self.lofilt.size())
 
-    #     y   = self.interleave_zeros(y_a, dim=3)[...,:,0:sz[1]]
-    #     y   = self.gausspyr_expand_pad(  y,   padding=2, axis=-1)
-    #     y   = Func.conv2d(y, K_horiz*2)
+        # max_band+1 below converts index into count
+        self.height = min(math.ceil(math.log2(ppd)-2), max_levels) + 1  #The 1 added is the base band
+        self.band_freqs = np.array([1.0] + [0.3228 * 2.0 ** (-f) for f in range(self.height)]) * self.ppd / 2.0
 
-    #     return y
+        self.pyr_shape = (self.height+1) * [None]  # shape (W,H) of each level of the pyramid
+        self.pyr_ind = (self.height+1) * [None]  # index to the elements at each level
+
+        cH = H
+        cW = W
+        self.pyr_shape[0] = (cH, cW)
+        for ll in range(self.height):
+            self.pyr_shape[ll+1] = (cH, cW)
+            cH = cH // 2
+            cW = cW // 2
 
 
+    def decompose(self, image):
+
+        hi0 = self.conv(image, self.hi0filt, type='corr')
+        lo0 = self.conv(image, self.lo0filt, type='corr')
+
+        pyr = self.buildLevels(lo0, self.height-1)
+
+        pyr.insert(0, hi0)  # I'm still not sure if I can simply add the base band
+
+        sigma = 10**(-0.781367) * self.ppd
+        L_adapt = self.localAdapt(image, sigma)
+
+        L_adapt = torch.mean(L_adapt, dim=0)
+
+        return pyr, L_adapt
+
+    def reconstruct(self, bands):
+        levels = self.height
+
+        image = self.reconstructLevels(bands, levels)
+
+        image = self.conv(image, self.lo0filt, type='conv') + self.conv(bands[0], self.hi0filt, type='conv')
+
+        return image
+
+    def localAdapt(self, image, sigma):
+        kernel_size = round(sigma, 6)
+        kernel_size = int(kernel_size + 1-np.mod(kernel_size, 2))
+        padding = self.get_pad([kernel_size, kernel_size])
+
+        image = torch.log(torch.clamp(image, min=1e-6))
+
+        #image = Func.pad(image, pad=padding, mode='reflect')
+
+        filt = GaussianBlur(kernel_size=(kernel_size, kernel_size), sigma=sigma)
+
+        image = filt(image)
+
+        return torch.exp(image)
+
+    def buildLevels(self, image, levels):
+
+        bands = []
+        bfiltsz = round(math.sqrt(self.bfilts.size()[0]))
+        filt = torch.reshape(self.bfilts, (bfiltsz, bfiltsz))
+
+        for _ in range(levels):
+            band = self.conv(image, filt, type='corr')
+            bands.append(band)
+
+            image = self.conv(image, self.lofilt, step=2, type='corr')
+
+        bands.append(image)
+
+        return bands
+
+    def reconstructLevels(self, pyr, levels):
+
+        res = pyr[-1]
+
+        bfiltsz = round(math.sqrt(self.bfilts.size()[0]))
+        filt = torch.reshape(self.bfilts, (bfiltsz, bfiltsz))
+
+        for level in reversed(range(levels - 1)):
+            size = pyr[level + 1].size()
+            res = self.conv(res, self.lofilt, step=2, type='conv', size=size)
+
+            band = pyr[level + 1]
+            res += self.conv(band, filt, type='conv')
+
+        return res
+
+    def get_gband(self, gbands, band):
+        return Resize(self.pyr_shape[band])(gbands)
+
+    '''
+    Determine the maximum pyramid height for a given image and filter sizes
+    '''
+
+    def max_levels(self, image_size, filter_size):
+
+        filter_size = filter_size[0]
+        levels = 0
+        while True:
+            if image_size < filter_size:
+                break
+            image_size = math.floor(image_size / 2)
+            levels += 1
+
+        return levels
+
+    def get_pad(self, size):
+        padding = []
+        for k in size:
+            if k % 2 == 0:
+                pad = [(k - 1) // 2, (k - 1) // 2 + 1]
+            else:
+                pad = [(k - 1) // 2, (k - 1) // 2]
+            padding.extend(pad)
+        return padding
+    '''
+    Compute the correlation/convolution between an image with a filter, followed by a downsampling/upsampling determined by the step.
+    '''
+
+    def conv(self, image, filt, step=1, type='corr', size=None):
+        # We are supposing the input image as BCHW
+
+        padding = self.get_pad(filt.size())
+
+        if type == 'conv':
+            image = image.unsqueeze(0)
+            if step>1:  # We need to apply upsampling first
+                im = image
+                image = torch.tensor(np.zeros((im.size()[0], size[0], size[1]), dtype=np.float32), device=self.device)
+                image[:, 0::step, 0::step] = im
+
+        image = Func.pad(image, pad=padding, mode='reflect')
+
+        if type == 'corr':
+            filt = filt.flip([0, 1])
+        filt = filt.unsqueeze(0)
+        filt = filt.unsqueeze(0)
+
+        output = Func.conv2d(image, filt, padding='valid')
+
+        if type == 'corr' and step > 1:  # We need to apply downsampling
+            output = output[:, :, 0::step, 0::step]
+
+        return output
+
+    '''
+    Get the filters used in Speerable Pyramid Algorithm
+    '''
+
+    def spFilter(self, filter='filter0'):
+
+        if filter == 'filter0':
+                harmonics = torch.tensor([
+                    [0]
+                ], device=self.device)
+
+                lo0filt = torch.tensor([
+                    [-4.514000e-04, - 1.137100e-04, - 3.725800e-04, - 3.743860e-03, - 3.725800e-04, - 1.137100e-04,
+                     - 4.514000e-04],
+                    [- 1.137100e-04, - 6.119520e-03, - 1.344160e-02, - 7.563200e-03, - 1.344160e-02, - 6.119520e-03,
+                     - 1.137100e-04],
+                    [- 3.725800e-04, - 1.344160e-02, 6.441488e-02, 1.524935e-01, 6.441488e-02, - 1.344160e-02,
+                     - 3.725800e-04],
+                    [- 3.743860e-03, - 7.563200e-03, 1.524935e-01, 3.153017e-01, 1.524935e-01, - 7.563200e-03,
+                     - 3.743860e-03],
+                    [- 3.725800e-04, - 1.344160e-02, 6.441488e-02, 1.524935e-01, 6.441488e-02, - 1.344160e-02,
+                     - 3.725800e-04],
+                    [- 1.137100e-04, - 6.119520e-03, - 1.344160e-02, - 7.563200e-03, - 1.344160e-02, - 6.119520e-03,
+                     - 1.137100e-04],
+                    [- 4.514000e-04, - 1.137100e-04, - 3.725800e-04, - 3.743860e-03, - 3.725800e-04, - 1.137100e-04,
+                     - 4.514000e-04]
+                ], device=self.device)
+
+                lofilt = torch.tensor([
+                    [-2.257000e-04, - 8.064400e-04, - 5.686000e-05, 8.741400e-04, - 1.862800e-04, - 1.031640e-03,
+                     - 1.871920e-03, - 1.031640e-03, - 1.862800e-04, 8.741400e-04, - 5.686000e-05, - 8.064400e-04,
+                     - 2.257000e-04],
+                    [- 8.064400e-04, 1.417620e-03, - 1.903800e-04, - 2.449060e-03, - 4.596420e-03, - 7.006740e-03,
+                     - 6.948900e-03, - 7.006740e-03, - 4.596420e-03, - 2.449060e-03, - 1.903800e-04, 1.417620e-03,
+                     - 8.064400e-04],
+                    [- 5.686000e-05, - 1.903800e-04, - 3.059760e-03, - 6.401000e-03, - 6.720800e-03, - 5.236180e-03,
+                     - 3.781600e-03, - 5.236180e-03, - 6.720800e-03, - 6.401000e-03, - 3.059760e-03, - 1.903800e-04,
+                     - 5.686000e-05],
+                    [8.741400e-04, - 2.449060e-03, - 6.401000e-03, - 5.260020e-03, 3.938620e-03, 1.722078e-02,
+                     2.449600e-02, 1.722078e-02, 3.938620e-03, - 5.260020e-03, - 6.401000e-03, - 2.449060e-03,
+                     8.741400e-04],
+                    [- 1.862800e-04, - 4.596420e-03, - 6.720800e-03, 3.938620e-03, 3.220744e-02, 6.306262e-02,
+                     7.624674e-02, 6.306262e-02, 3.220744e-02, 3.938620e-03, - 6.720800e-03, - 4.596420e-03,
+                     - 1.862800e-04],
+                    [- 1.031640e-03, - 7.006740e-03, - 5.236180e-03, 1.722078e-02, 6.306262e-02, 1.116388e-01,
+                     1.348999e-01, 1.116388e-01, 6.306262e-02, 1.722078e-02, - 5.236180e-03, - 7.006740e-03,
+                     - 1.031640e-03],
+                    [- 1.871920e-03, - 6.948900e-03, - 3.781600e-03, 2.449600e-02, 7.624674e-02, 1.348999e-01,
+                     1.576508e-01, 1.348999e-01, 7.624674e-02, 2.449600e-02, - 3.781600e-03, - 6.948900e-03,
+                     - 1.871920e-03],
+                    [- 1.031640e-03, - 7.006740e-03, - 5.236180e-03, 1.722078e-02, 6.306262e-02, 1.116388e-01,
+                     1.348999e-01, 1.116388e-01, 6.306262e-02, 1.722078e-02, - 5.236180e-03, - 7.006740e-03,
+                     - 1.031640e-03],
+                    [- 1.862800e-04, - 4.596420e-03, - 6.720800e-03, 3.938620e-03, 3.220744e-02, 6.306262e-02,
+                     7.624674e-02, 6.306262e-02, 3.220744e-02, 3.938620e-03, - 6.720800e-03, - 4.596420e-03,
+                     - 1.862800e-04],
+                    [8.741400e-04, - 2.449060e-03, - 6.401000e-03, - 5.260020e-03, 3.938620e-03, 1.722078e-02,
+                     2.449600e-02, 1.722078e-02, 3.938620e-03, - 5.260020e-03, - 6.401000e-03, - 2.449060e-03,
+                     8.741400e-04],
+                    [- 5.686000e-05, - 1.903800e-04, - 3.059760e-03, - 6.401000e-03, - 6.720800e-03, - 5.236180e-03,
+                     - 3.781600e-03, - 5.236180e-03, - 6.720800e-03, - 6.401000e-03, - 3.059760e-03, - 1.903800e-04,
+                     - 5.686000e-05],
+                    [- 8.064400e-04, 1.417620e-03, - 1.903800e-04, - 2.449060e-03, - 4.596420e-03, - 7.006740e-03,
+                     - 6.948900e-03, - 7.006740e-03, - 4.596420e-03, - 2.449060e-03, - 1.903800e-04, 1.417620e-03,
+                     - 8.064400e-04],
+                    [- 2.257000e-04, - 8.064400e-04, - 5.686000e-05, 8.741400e-04, - 1.862800e-04, - 1.031640e-03,
+                     - 1.871920e-03, - 1.031640e-03, - 1.862800e-04, 8.741400e-04, - 5.686000e-05, - 8.064400e-04,
+                     - 2.257000e-04]
+                ], device=self.device)
+
+                mtx = torch.tensor([
+                    [1.000000]
+                ], device=self.device)
+
+                hi0filt = torch.tensor([
+                    [5.997200e-04, - 6.068000e-05, - 3.324900e-04, - 3.325600e-04, - 2.406600e-04, - 3.325600e-04,
+                     - 3.324900e-04, - 6.068000e-05, 5.997200e-04],
+                    [- 6.068000e-05, 1.263100e-04, 4.927100e-04, 1.459700e-04, - 3.732100e-04, 1.459700e-04,
+                     4.927100e-04, 1.263100e-04, - 6.068000e-05],
+                    [- 3.324900e-04, 4.927100e-04, - 1.616650e-03, - 1.437358e-02, - 2.420138e-02, - 1.437358e-02,
+                     - 1.616650e-03, 4.927100e-04, - 3.324900e-04],
+                    [- 3.325600e-04, 1.459700e-04, - 1.437358e-02, - 6.300923e-02, - 9.623594e-02, - 6.300923e-02,
+                     - 1.437358e-02, 1.459700e-04, - 3.325600e-04],
+                    [- 2.406600e-04, - 3.732100e-04, - 2.420138e-02, - 9.623594e-02, 8.554893e-01, - 9.623594e-02,
+                     - 2.420138e-02, - 3.732100e-04, - 2.406600e-04],
+                    [- 3.325600e-04, 1.459700e-04, - 1.437358e-02, - 6.300923e-02, - 9.623594e-02, - 6.300923e-02,
+                     - 1.437358e-02, 1.459700e-04, - 3.325600e-04],
+                    [- 3.324900e-04, 4.927100e-04, - 1.616650e-03, - 1.437358e-02, - 2.420138e-02, - 1.437358e-02,
+                     - 1.616650e-03, 4.927100e-04, - 3.324900e-04],
+                    [- 6.068000e-05, 1.263100e-04, 4.927100e-04, 1.459700e-04, - 3.732100e-04, 1.459700e-04,
+                     4.927100e-04, 1.263100e-04, - 6.068000e-05],
+                    [5.997200e-04, - 6.068000e-05, - 3.324900e-04, - 3.325600e-04, - 2.406600e-04, - 3.325600e-04,
+                     - 3.324900e-04, - 6.068000e-05, 5.997200e-04]
+                ], device=self.device)
+
+                bfilts = torch.tensor([[
+                    -9.066000e-05, - 1.738640e-03, - 4.942500e-03, - 7.889390e-03, - 1.009473e-02, - 7.889390e-03,
+                    - 4.942500e-03, - 1.738640e-03, - 9.066000e-05,
+                    - 1.738640e-03, - 4.625150e-03, - 7.272540e-03, - 7.623410e-03, - 9.091950e-03, - 7.623410e-03,
+                    - 7.272540e-03, - 4.625150e-03, - 1.738640e-03,
+                    - 4.942500e-03, - 7.272540e-03, - 2.129540e-02, - 2.435662e-02, - 3.487008e-02, - 2.435662e-02,
+                    - 2.129540e-02, - 7.272540e-03, - 4.942500e-03,
+                    - 7.889390e-03, - 7.623410e-03, - 2.435662e-02, - 1.730466e-02, - 3.158605e-02, - 1.730466e-02,
+                    - 2.435662e-02, - 7.623410e-03, - 7.889390e-03,
+                    - 1.009473e-02, - 9.091950e-03, - 3.487008e-02, - 3.158605e-02, 9.464195e-01, - 3.158605e-02,
+                    - 3.487008e-02, - 9.091950e-03, - 1.009473e-02,
+                    - 7.889390e-03, - 7.623410e-03, - 2.435662e-02, - 1.730466e-02, - 3.158605e-02, - 1.730466e-02,
+                    - 2.435662e-02, - 7.623410e-03, - 7.889390e-03,
+                    - 4.942500e-03, - 7.272540e-03, - 2.129540e-02, - 2.435662e-02, - 3.487008e-02, - 2.435662e-02,
+                    - 2.129540e-02, - 7.272540e-03, - 4.942500e-03,
+                    - 1.738640e-03, - 4.625150e-03, - 7.272540e-03, - 7.623410e-03, - 9.091950e-03, - 7.623410e-03,
+                    - 7.272540e-03, - 4.625150e-03, - 1.738640e-03,
+                    - 9.066000e-05, - 1.738640e-03, - 4.942500e-03, - 7.889390e-03, - 1.009473e-02, - 7.889390e-03,
+                    - 4.942500e-03, - 1.738640e-03, - 9.066000e-05
+                ]], device=self.device).t()
+
+        return lo0filt, hi0filt, lofilt, bfilts, mtx, harmonics
 
 # if __name__ == '__main__':
 
@@ -352,4 +610,5 @@ class fvvdp_contrast_pyr(fvvdp_lpyr_dec):
 #     # print("----Laplacian----")
 #     # for li in range(lp.get_band_count()):
 #     #     print(lp.get_band(lpyr, li))
+
 
