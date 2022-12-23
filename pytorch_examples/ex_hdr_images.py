@@ -5,7 +5,7 @@ import ex_utils as utils
 
 import pyfvvdp
 
-I_ref = pyfvvdp.load_image_as_array(os.path.join('example_media', 'nancy_church.hdr'))
+I_ref = pyfvvdp.load_image_as_array(os.path.join('../example_media', 'nancy_church.hdr'))
 
 noise_fname = os.path.join('example_media', 'wavy_facade_noise.png')
 L_peak = 4000   # Peak luminance of an HDR display
@@ -27,7 +27,7 @@ I_test_blur = utils.imgaussblur(I_ref, 2)
 # Note that many HDR images are in rec709 color space, so no need to
 # specify rec2020. 
 disp_photo = pyfvvdp.fvvdp_display_photo_absolute(L_peak)
-fv = pyfvvdp.fvvdp(display_name='standard_hdr', display_photometry=disp_photo, heatmap='threshold')
+fv = pyfvvdp.fvvdp(display_name='standard_hdr_linear', display_photometry=disp_photo, heatmap='threshold')
 
 # predict() method can handle numpy ndarrays or PyTorch tensors. The data
 # type should be float32, int16 or uint8.
@@ -42,11 +42,11 @@ blur_str = f'Blur - Quality: {Q_JOD_blur:.3f} JOD'
 print( blur_str )
 
 f, axs = plt.subplots(1, 2)
-axs[0].imshow( stats_noise['heatmap'][0,:,0,:,:].permute([1,2,0]).cpu().numpy() )
+axs[0].imshow( stats_noise['heatmap'][0,:,0,:,:].permute([1,2,0]).cpu().numpy().astype(np.float64) )
 axs[0].set_xticks([])
 axs[0].set_yticks([])
 axs[0].set_title(noise_str)
-axs[1].imshow( stats_blur['heatmap'][0,:,0,:,:].permute([1,2,0]).cpu().numpy() )
+axs[1].imshow( stats_blur['heatmap'][0,:,0,:,:].permute([1,2,0]).cpu().numpy().astype(np.float64) )
 axs[1].set_xticks([])
 axs[1].set_yticks([])
 axs[1].set_title(blur_str)
